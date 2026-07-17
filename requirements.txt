@@ -1,0 +1,6 @@
+# NetScope - Network Scanner & Reconnaissance Tool
+# Optional dependencies. The tool runs with stdlib only if these are missing
+# (scapy is used for ARP ping sweep; requests is used for crt.sh subdomain enum).
+
+scapy>=2.5.0     # Optional: enables ARP ping sweep (requires root)
+requests>=2.31.0 # Optional: enables crt.sh passive subdomain enumeration
