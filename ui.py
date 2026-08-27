@@ -28,6 +28,32 @@ except ImportError:  # pragma: no cover - exercised when dependencies are absent
     ui = None
 
 
+APP_ROOT = Path(__file__).resolve().parent
+
+
+def _resolve_output_directory(value: str | Path) -> Path:
+    """Anchor relative UI output paths to the application directory."""
+    path = Path(str(value or "")).expanduser()
+    return path if path.is_absolute() else APP_ROOT / path
+
+
+def _normalize_output_formats(value: Any) -> list[str]:
+    """Normalize NiceGUI select values (labels, indices, or option dicts)."""
+    options = ("json", "text", "html")
+    if not isinstance(value, (list, tuple, set)):
+        value = [value]
+    normalized: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            item = item.get("label", item.get("value"))
+        if isinstance(item, int) and 0 <= item < len(options):
+            item = options[item]
+        item = str(item).lower()
+        if item in options and item not in normalized:
+            normalized.append(item)
+    return normalized
+
+
 def _report_files(root: str | Path) -> tuple[list[Path], list[str]]:
     directory = Path(root).expanduser()
     if not directory.exists():
@@ -100,7 +126,7 @@ def build_app() -> None:
     if ui is None:
         raise RuntimeError("NiceGUI is not installed; run `python -m pip install -r requirements.txt`")
     settings = load_settings()
-    output_root = Path(str(settings.get("output_directory", "output"))).expanduser()
+    output_root = _resolve_output_directory(str(settings.get("output_directory", "output")))
     live = LiveScanState()
     event_queue: queue.Queue = queue.Queue()
     cancellation: Optional[CancellationToken] = None
@@ -229,6 +255,7 @@ def build_app() -> None:
 
                 def read_form() -> ScanForm:
                     values = {key: (value.value if hasattr(value, "value") else value) for key, value in inputs.items()}
+                    values["output_formats"] = _normalize_output_formats(values.get("output_formats"))
                     return ScanForm(**values)
 
                 def validate_view() -> None:
@@ -347,8 +374,10 @@ def build_app() -> None:
                 def save():
                     nonlocal output_root
                     try:
-                        validate_output_dir(str(output.value), create=True)
-                        output_root = Path(str(output.value)).expanduser()
+                        new_output_root = _resolve_output_directory(str(output.value))
+                        validate_output_dir(str(new_output_root), create=True)
+                        output_root = new_output_root
+                        output.value = str(output_root)
                         save_settings({"theme": theme.value, "default_profile": profile.value, "timeout": timeout.value, "workers": workers.value, "rate_limit": rate.value, "output_directory": str(output.value), "reverse_dns": rdns.value, "banner_inspection": banner.value})
                         setting_status.set_text("Saved locally.")
                         dashboard.refresh()
@@ -433,7 +462,7 @@ def build_app() -> None:
             if errors:
                 validate_view(); switch("new"); return
             try:
-                candidate.output_directory = str(Path(candidate.output_directory).expanduser())
+                candidate.output_directory = str(_resolve_output_directory(candidate.output_directory))
                 validate_output_dir(candidate.output_directory, create=True)
             except ValidationError as exc:
                 error_labels["output_directory"].set_text(str(exc)); error_labels["output_directory"].set_visibility(True); return
@@ -448,7 +477,10 @@ def build_app() -> None:
                 current_result = await run.io_bound(_run_engine, request, cancellation, event_queue)
                 if current_result and current_result.report:
                     dashboard.refresh(); reports.refresh(); assets.refresh(); compare.refresh()
-                final_state.set_text({"completed": "Scan completed successfully.", "cancelled": "Scan cancelled; partial results were preserved.", "failed": "Scan failed: " + "; ".join(current_result.errors)}.get(current_result.status, current_result.status))
+                message = {"completed": "Scan completed successfully.", "cancelled": "Scan cancelled; partial results were preserved.", "failed": "Scan failed: " + "; ".join(current_result.errors)}.get(current_result.status, current_result.status)
+                if current_result.status == "completed" and request.output_directory:
+                    message += f" Reports saved in {request.output_directory}"
+                final_state.set_text(message)
             except Exception as exc:
                 live.status = "failed"; live.error = str(exc); final_state.set_text(f"Scan failed: {exc}")
             finally:

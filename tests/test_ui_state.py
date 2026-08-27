@@ -1,5 +1,6 @@
 from modules.engine import ScanEvent
 from modules.ui_state import LiveScanState, ScanForm, validate_scan_form
+from ui import APP_ROOT, _normalize_output_formats, _resolve_output_directory
 
 
 def test_form_validation_is_field_specific():
@@ -19,3 +20,8 @@ def test_live_state_transitions():
     assert state.status == "running" and state.hosts_discovered == 1 and state.open_ports == 1
     state.apply(ScanEvent("scan_cancelled", "2026-01-01T00:00:00Z", progress=1, message="cancelled"))
     assert state.status == "cancelled"
+
+
+def test_ui_output_path_and_format_values_are_normalized():
+    assert _resolve_output_directory("output") == APP_ROOT / "output"
+    assert _normalize_output_formats([{"value": 0, "label": "json"}, 2, "text", "text"]) == ["json", "html", "text"]

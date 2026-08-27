@@ -238,7 +238,9 @@ On Kali Linux, interface settings are stored in:
 ```
 
 Only non-secret preferences are stored. Scan results are written to the
-configured output directory, which defaults to `output/`.
+configured output directory, which defaults to `output/`. In the web
+interface, a relative directory is anchored to the folder containing `ui.py`;
+CLI output paths remain relative to the directory where the command is run.
 
 ## Project structure
 
