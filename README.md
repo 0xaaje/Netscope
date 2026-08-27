@@ -74,7 +74,7 @@ are not required.
 sudo apt update
 sudo apt install python3-full python3-venv
 
-git clone https://github.com/0xaaje/netscope.git
+git clone https://github.com/0xaaje/Netscope.git
 cd netscope
 
 python3 -m venv .venv
