@@ -1,222 +1,290 @@
-# NetScope
+# NetScope v2
 
-> Network Scanner & Reconnaissance Toolkit for **authorized** testing on
-> networks you own or have written permission to assess.
-> Designed for **Kali Linux** (and any Python 3.9+ POSIX system).
+![Version](https://img.shields.io/badge/version-2.0.0-35b8e8)
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)
+![Platform](https://img.shields.io/badge/platform-Kali%20Linux-557C94)
+![Interface](https://img.shields.io/badge/interface-NiceGUI-42d392)
+![Tests](https://img.shields.io/badge/tests-pytest-f2b84b)
 
-NetScope is a single-file-CLI tool with a small set of focused modules:
+NetScope is a local network reconnaissance toolkit built for authorized
+security assessments. It combines IPv4 host discovery, TCP connect scanning,
+service and OS identification, subdomain enumeration, structured findings,
+and report comparison behind both a command-line interface and a responsive
+browser-based dashboard.
 
-| Module             | What it does                                                      |
-|--------------------|-------------------------------------------------------------------|
-| `ping_sweep`       | ICMP or ARP host discovery (multi-threaded)                       |
-| `port_scanner`     | Multi-threaded TCP connect scan + banner grabbing                 |
-| `service_detect`   | OS & service version guesses parsed from banners                  |
-| `subdomain_enum`   | crt.sh (passive) and/or wordlist (active) subdomain enumeration  |
-| `exporter`         | JSON + human-readable text report                                 |
+The scanner is intentionally non-exploitative: it performs connect-only TCP
+checks, bounded banner inspection, DNS queries, and optional ARP discovery on
+directly connected networks. An open port is reported as an observation, not
+as proof of a vulnerability.
 
-It is **connect-only TCP** and a **banner-only** fingerprinter — no exploit
-payloads, no raw SYN scans, no crafted probes. It is intentionally quieter
-than nmap so it stays portable and audit-friendly.
+> [!IMPORTANT]
+> Use NetScope only on systems you own or have explicit written permission to
+> assess. You are responsible for following applicable laws and network policy.
 
----
+## Highlights
 
-## 1. Directory layout
+- Safe IPv4 target parsing for single addresses, CIDRs, ranges, and lists
+- ICMP discovery with automatic ARP selection only on eligible local networks
+- Concurrent TCP connect scanning with configurable workers, timeouts, and rate limits
+- Quick, Standard, Full, and Custom scan profiles
+- Banner-based service and version identification
+- Best-effort OS detection using banner evidence and observed ICMP TTL
+- HTTP response and TLS certificate observations
+- Passive and active subdomain enumeration
+- Structured progress events and cooperative cancellation
+- Partial-result preservation when a scan is interrupted
+- JSON, text, and self-contained HTML reports
+- Report comparison for hosts, ports, services, TLS certificates, and findings
+- Local NiceGUI interface bound to `127.0.0.1` by default
 
+## What's new in v2
+
+Version 2 separates the scan engine from the user interfaces, so the CLI and
+web application share the same validation, execution, cancellation, and
+reporting paths. It also introduces the local operations dashboard, live scan
+events, asset inventory, HTML reports, TLS/HTTP observations, report
+comparison, persistent local settings, stricter input validation, and safer
+ARP fallback behavior.
+
+## Architecture
+
+```text
+CLI ─────────┐
+             ├── Scan Engine ── Events / Results ── Reports
+NiceGUI ─────┘
 ```
-netscope/
-├── scanner.py              # main CLI (argparse, all subcommands)
-├── requirements.txt        # optional deps (scapy, requests)
-├── modules/
-│   ├── __init__.py
-│   ├── utils.py            # color, parsing, port presets, logger
-│   ├── ping_sweep.py       # ICMP / ARP
-│   ├── port_scanner.py     # TCP connect + banner grab
-│   ├── service_detect.py   # banner → service/OS guess
-│   ├── subdomain_enum.py   # crt.sh + wordlist
-│   └── exporter.py         # JSON + text reports
-├── wordlists/
-│   └── subdomains.txt      # ~200-entry starter list (auto-created)
-├── output/                 # reports land here when -o is used
-└── logs/                   # reserved for future log files
-```
 
----
+The interface never launches the CLI or parses terminal output. Both entry
+points call the reusable engine directly, while worker threads publish
+structured events through a thread-safe queue.
 
-## 2. Install (Kali Linux)
+## Requirements
+
+- Kali Linux or another Linux environment with Python 3.10+
+- `python3-venv`
+- The system `ping` command for unprivileged ICMP discovery
+- A modern browser for the optional local interface
+
+Node.js, a separate frontend build, and root access for the full application
+are not required.
+
+## Installation on Kali Linux
 
 ```bash
-# 1. Get the code
-git clone <your-repo-url> netscope
+sudo apt update
+sudo apt install python3-full python3-venv
+
+git clone https://github.com/0xaaje/netscope.git
 cd netscope
 
-# 2. (Recommended) virtualenv so system Python stays clean
 python3 -m venv .venv
 source .venv/bin/activate
 
-# 3. Optional deps
-#    - scapy   → enables ARP sweep (faster, finds ICMP-blocked hosts)
-#    - requests → enables crt.sh passive subdomain enum
-#    Both are listed in requirements.txt:
-pip install -r requirements.txt
-
-# 4. Make the launcher executable (optional)
-chmod +x scanner.py
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-The tool runs on stdlib alone if you skip `pip install` — but you'll lose
-ARP sweep and crt.sh.
-
-### Raw sockets & sudo
-
-| Operation                | Needs root? | Why                                           |
-|--------------------------|-------------|-----------------------------------------------|
-| ICMP ping sweep          | sometimes   | Some kernels only allow unprivileged ICMP for limited sizes; on Kali, plain user works. |
-| ARP sweep (scapy)        | **yes**     | Raw L2 frames require `CAP_NET_RAW`.          |
-| TCP connect scan         | no          | Plain `connect()` — no raw sockets.           |
-| Banner grab              | no          | Just a socket read.                           |
-| DNS / crt.sh             | no          | Outbound HTTP + DNS only.                     |
-
-**Run the full scan with sudo for best results:**
+## Start the local interface
 
 ```bash
-sudo python3 scanner.py scan 192.168.1.0/24 -o output/home
+source .venv/bin/activate
+python ui.py
 ```
 
-A non-root run is fine; you'll just get ICMP sweep instead of ARP.
+You can also start it through the main CLI:
 
----
-
-## 3. Usage
-
-```text
-python3 scanner.py <command> [options] <target>
+```bash
+python scanner.py ui
 ```
 
-### Commands at a glance
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080). The server runs in
+browser mode, binds to loopback by default, and keeps settings and reports on
+the local filesystem.
 
-| Command      | Purpose                                                  |
-|--------------|----------------------------------------------------------|
-| `ping`       | host discovery only (no port scan)                       |
-| `port`       | TCP port scan of a single host                           |
-| `scan`       | discover + TCP port scan + service/OS detection          |
-| `subdomains` | enumerate subdomains of a domain                         |
-| `all`        | `scan` + (if target is a domain) subdomain enumeration   |
+### Interface sections
 
-### Common flags
+| Section | Purpose |
+| --- | --- |
+| Dashboard | Saved scan totals, discovered hosts, open ports, findings, recent activity, and running status |
+| New Scan | Target, profile, discovery, ports, timeout, workers, rate limit, output, and authorization controls |
+| Live Scan | Current phase, progress, elapsed time, discovered hosts, open ports, event log, and cancellation |
+| Assets | Searchable and sortable host inventory with detailed technical observations |
+| Reports | JSON, text, and HTML viewing, downloads, corrupted-file errors, and confirmed deletion |
+| Compare | Differences between two compatible completed reports |
+| Settings | Local defaults for theme, profiles, timeouts, workers, output, DNS, banners, and rate limiting |
 
+## Command-line usage
+
+```bash
+python scanner.py --help
+python scanner.py --version
+python scanner.py COMMAND --help
 ```
-  -t / --timeout FLOAT   per-probe timeout in seconds (default 1.5)
-  -w / --workers  INT    concurrent workers (default 200)
-  -o / --output   DIR    write JSON+text report into DIR
-  -f / --format   FMT    json | text | both (default both)
-  -q / --quiet           suppress info-level stderr
-  -v / --verbose         debug-level stderr
-  --no-color             disable ANSI color
-```
+
+| Command | Description |
+| --- | --- |
+| `ping TARGET` | Discover live IPv4 hosts |
+| `port TARGET` | Scan one IPv4 address or resolvable domain |
+| `scan TARGET` | Discover hosts, scan ports, and identify services and OS evidence |
+| `subdomains DOMAIN` | Run passive, active, or combined subdomain enumeration |
+| `all TARGET` | Run network scanning and enumerate subdomains when the target is a domain |
+| `ui` | Start the local NiceGUI application |
+
+NetScope asks for authorization confirmation before a CLI scan. For controlled
+automation, place `--yes` before the command or set
+`NETSCOPE_I_KNOW_WHAT_IM_DOING=1`.
 
 ### Examples
 
-```bash
-# 1. Discover live hosts on the LAN (with reverse DNS)
-sudo python3 scanner.py ping 192.168.1.0/24 --rdns -o output/lan
-
-# 2. Top-1000 port scan of a single host, no banners (faster)
-python3 scanner.py port 192.168.1.10 --ports top1000 --no-banner
-
-# 3. Full scan of a /24 with everything on
-sudo python3 scanner.py scan 192.168.1.0/24 --ports top1000 -o output/home
-
-# 4. Custom port list (SSH, HTTP, HTTPS, RDP, MySQL, RDP)
-python3 scanner.py port 10.0.0.5 --ports 22,80,443,3306,3389 -o output/dbhost
-
-# 5. Subdomain enum (crt.sh + bundled wordlist)
-python3 scanner.py subdomains example.com -o output/example
-
-# 6. Passive only (crt.sh) — no DNS load
-python3 scanner.py subdomains example.com --method passive
-
-# 7. Use a custom wordlist
-python3 scanner.py subdomains example.com --wordlist /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
-
-# 8. All-in-one against a domain
-sudo python3 scanner.py all example.com --ports top1000 -o output/example_full
-```
-
-### Safety prompt
-
-The first time you run a target, NetScope asks:
-
-```
-Type 'yes' to continue, anything else to abort:
-```
-
-In CI / non-interactive shells, set:
+Discover a local subnet:
 
 ```bash
-export NETSCOPE_I_KNOW_WHAT_IM_DOING=1
+python scanner.py --yes ping 192.168.1.0/24 --method auto --no-rdns
 ```
 
----
+Scan selected ports on one host:
 
-## 4. Output
-
-With `-o output/run1`, two files are written:
-
-```
-output/run1/
-├── report.json   # machine-readable, complete record
-└── report.txt    # human-readable, paste-friendly summary
+```bash
+python scanner.py --yes port 192.168.1.10 --ports 22,80,443 --output output/host
 ```
 
-`report.json` is a single object with this shape:
+Run the Standard profile and create every report format:
 
-```jsonc
-{
-  "meta":   { "tool": "NetScope", "version": "1.0.0",
-              "target": "192.168.1.0/24",
-              "started_at": "...", "finished_at": "...",
-              "duration_s": 12.34, "scan": { ... } },
-  "hosts":  [ { "ip": "...", "alive": true, "mac": "...", ... } ],
-  "alive_hosts": [ "192.168.1.1", ... ],
-  "port_results":     { "192.168.1.10": [ { "port": 22, "open": true, ... } ] },
-  "service_guesses":  { "192.168.1.10": [ { "product": "OpenSSH", "version": "8.9p1" } ] },
-  "os_guesses":       { "192.168.1.10": { "family": "Linux", ... } },
-  "subdomains":       [ { "subdomain": "www.example.com", "ips": [...], ... } ]
-}
+```bash
+python scanner.py --yes scan 192.168.1.0/24 \
+  --profile standard \
+  --rate-limit 500 \
+  --format all \
+  --output output/lan
 ```
 
----
+Enumerate subdomains:
 
-## 5. Performance notes
+```bash
+python scanner.py --yes subdomains example.com --method both --output output/domain
+```
 
-- Default worker counts (200 for ports, 128 for ICMP, 32 for DNS) are
-  tuned for a Linux loopback / lab network. On noisy networks raise
-  `--timeout` and lower `--workers`; on a fast LAN you can raise both.
-- ARP sweep is much faster than ICMP on a /24 because it doesn't wait
-  for the kernel's ICMP rate-limiter.
-- Banner grabbing has its own 1.5s read budget per port. Use
-  `--no-banner` for raw speed when you only need port state.
+Run the complete workflow for a domain:
 
----
+```bash
+python scanner.py --yes all example.com --profile quick --output output/example
+```
 
-## 6. Limitations
+## Scan profiles and port syntax
 
-- This is **not** nmap. OS detection is banner-based, not TCP/IP stack
-  fingerprinting. Service version detection is regex-based and
-  approximate.
-- No UDP scanning (would need raw sockets, slow, easily missed).
-- No IDS/IPS evasion (no fragmentation, no decoys). Don't point this at
-  production networks.
-- The crt.sh endpoint can rate-limit or be slow. Treat it as
-  best-effort.
+| Profile | Port coverage |
+| --- | --- |
+| Quick | Exactly 100 curated TCP service ports |
+| Standard | TCP ports 1–1000 |
+| Full | TCP ports 1–65535 |
+| Custom | A preset, individual ports, ranges, or comma-separated combinations |
 
----
+Accepted custom examples:
 
-## 7. Legal
+```text
+top100
+top1000
+22,80,443
+8000-8100
+22,80,443,8000-8100
+```
 
-Run NetScope **only** against systems you own or have explicit written
-permission to test. Unauthorized port scanning, banner grabbing, and
-subdomain enumeration can violate computer-misuse laws in many
-jurisdictions (e.g. CFAA in the US, Computer Misuse Act in the UK, and
-similar laws elsewhere). The authors of NetScope accept no liability
-for misuse.
+Targets may be a single IPv4 address, CIDR, inclusive range, or comma-separated
+list. IPv6 is rejected before network activity because the current discovery
+and connection paths are intentionally IPv4-only.
+
+## Discovery and privileges
+
+The application should run as a normal user. In `auto` mode, ARP is used only
+when all requested addresses are on a directly connected IPv4 route, Scapy is
+available, and the process has the required raw-socket privilege. Otherwise,
+NetScope uses the unprivileged ICMP path.
+
+An explicit `--method arp` request fails with a clear dependency or privilege
+message when ARP is unavailable. The web server never invokes `sudo`, and the
+project does not assign broad capabilities to the Python interpreter.
+
+## Reports
+
+Use `--format` to select the output:
+
+| Value | Files written |
+| --- | --- |
+| `json` | `report.json` only |
+| `text` | `report.txt` only |
+| `both` | `report.json` and `report.txt` |
+| `html` | `report.html` only |
+| `all` | JSON, text, and HTML |
+
+JSON reports use schema version 2 and retain the original host, port, service,
+OS, and subdomain structures. They also record scan status, coverage,
+warnings, errors, HTTP/TLS observations, evidence-based findings, timestamps,
+and duration.
+
+HTML reports are self-contained, use inline styling, require no CDN, and
+escape network-derived content. Findings include severity, affected host and
+port, direct evidence, classification, confidence, and practical remediation.
+
+Comparisons are conservative. NetScope reports a change only when both scans
+completed successfully and the later scan provides sufficient coverage;
+cancelled or incomplete scans remain indeterminate.
+
+## Local settings
+
+On Kali Linux, interface settings are stored in:
+
+```text
+~/.config/netscope/settings.json
+```
+
+Only non-secret preferences are stored. Scan results are written to the
+configured output directory, which defaults to `output/`.
+
+## Project structure
+
+```text
+netscope/
+├── scanner.py                 # CLI entry point
+├── ui.py                      # Local NiceGUI application
+├── modules/
+│   ├── engine.py              # Shared scan orchestration and events
+│   ├── ping_sweep.py          # ICMP and ARP discovery
+│   ├── port_scanner.py        # TCP connect scanning and observations
+│   ├── service_detect.py      # Service and OS heuristics
+│   ├── subdomain_enum.py      # Passive and active enumeration
+│   ├── exporter.py            # JSON, text, and HTML reports
+│   ├── comparison.py          # Report comparison
+│   ├── ui_state.py            # UI form and live-state validation
+│   ├── settings.py            # Local settings persistence
+│   └── utils.py               # Shared parsing and validation
+├── tests/                     # Deterministic pytest suite
+├── requirements.txt           # Runtime dependencies
+└── requirements-dev.txt       # Development dependencies
+```
+
+## Development
+
+```bash
+python -m pip install -r requirements-dev.txt
+pytest -q
+ruff check .
+python -m compileall -q .
+```
+
+The test suite uses mocks and deterministic fixtures. It does not scan
+external systems.
+
+## Limitations
+
+- IPv6 and UDP scanning are not implemented.
+- OS and service detection are evidence-based heuristics, not authoritative fingerprinting.
+- Passive subdomain discovery requires internet access to query certificate-transparency data.
+- DNS resolution duration can depend on the operating system resolver.
+- In-flight socket operations may continue until their configured timeout after cancellation.
+- Full-profile scans are intentionally expensive and should be rate-limited on larger targets.
+
+## Responsible use
+
+NetScope is intended for defensive administration, asset discovery,
+laboratory work, and explicitly authorized security testing. Do not use it to
+probe third-party infrastructure without permission.

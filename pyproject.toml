@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = [".venv", "output", "reports", "**/__pycache__", "test-temp", "pytest-temp"]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]

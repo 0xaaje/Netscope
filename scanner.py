@@ -1,33 +1,8 @@
 #!/usr/bin/env python3
-"""NetScope - Network Scanner & Reconnaissance Toolkit.
+"""NetScope command-line adapter.
 
-A modular, multi-threaded scanner for authorized testing on networks you
-own or have written permission to assess.  Designed to run on Kali Linux
-with stdlib only; the optional deps (scapy, requests) unlock extra
-features (ARP sweep, crt.sh passive subdomain enum).
-
-Modules:
-    ping_sweep        ICMP / ARP host discovery
-    port_scanner      multi-threaded TCP connect + banner grab
-    service_detect    OS & service version guesses from banners
-    subdomain_enum    crt.sh + wordlist subdomain enumeration
-    exporter          JSON + human-readable text reports
-    utils             shared helpers (color, parsing, port presets)
-
-Usage examples (see README.md for the full guide):
-    # Discover hosts on a /24
-    sudo python3 scanner.py ping 192.168.1.0/24
-
-    # Port-scan + service detection on the live hosts
-    sudo python3 scanner.py scan 192.168.1.0/24 --ports top1000
-
-    # Subdomain enumeration
-    python3 scanner.py subdomains example.com
-
-    # Full sweep of one target
-    sudo python3 scanner.py all 192.168.1.10 --ports 1-65535 -o output/
-
-Safety: NO exploit payloads.  Connect-only TCP, banner-only fingerprints.
+The scanner engine lives in :mod:`modules.engine` so the CLI and NiceGUI use
+the same validation, events, cancellation, and report generation paths.
 """
 from __future__ import annotations
 
@@ -36,409 +11,248 @@ import os
 import signal
 import sys
 import traceback
-from typing import Dict, List
+from typing import List
 
-# Make `python3 scanner.py` work without requiring the user to install the
-# package.  Anything we import from .modules can also be reached by adding
-# the script's directory to sys.path.
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from modules import utils as U                 # noqa: E402
-from modules.ping_sweep import ping_sweep, reverse_dns   # noqa: E402
-from modules.port_scanner import port_scan               # noqa: E402
-from modules.service_detect import detect_services, detect_os  # noqa: E402
-from modules.subdomain_enum import enumerate_subdomains, ensure_default_wordlist  # noqa: E402
-from modules.exporter import build_report, write_json, write_text  # noqa: E402
+from modules import __version__  # noqa: E402
+from modules.engine import CancellationToken, ScanEngine, ScanEvent, ScanRequest  # noqa: E402
+from modules.utils import ValidationError, parse_ports  # noqa: E402
+from modules import utils as U  # noqa: E402
 
 
-# --- Subcommand implementations -------------------------------------------
+_active_token: CancellationToken | None = None
+
+
+def _event_logger(event: ScanEvent, logger) -> None:
+    if event.type == "port_opened":
+        logger.ok(event.message)
+    elif event.type == "host_discovered":
+        logger.ok(event.message)
+    elif event.type == "finding_created":
+        logger.warn(event.message)
+    elif event.type in {"scan_failed", "scan_cancelled"}:
+        logger.warn(event.message)
+    elif event.message and event.type in {"phase_started", "progress_updated"}:
+        logger.info(event.message)
+
+
+def _run(args, logger, operation: str) -> int:
+    request = _request_from_args(args, operation)
+    token = CancellationToken()
+    global _active_token
+    _active_token = token
+    install_signal_handlers(logger, token)
+    engine = ScanEngine(logger=logger)
+    result = engine.run(request, event_sink=lambda event: _event_logger(event, logger), cancellation=token)
+    _active_token = None
+    if result.status == "cancelled":
+        return 130
+    return 0 if result.status == "completed" else 1
+
 
 def cmd_ping(args, logger):
-    started = U.utcnow_iso()
-    hosts = ping_sweep(
-        args.target,
-        timeout=args.timeout,
-        workers=args.workers,
-        method=args.ping_method,
-        logger=logger,
-    )
-    if args.rdns:
-        reverse_dns(hosts, timeout=1.0)
-        for h in hosts:
-            if h.hostname:
-                logger.ok(f"  {h.ip:<15s}  {U.dim('hostname=' + h.hostname)}")
-    finished = U.utcnow_iso()
-
-    if args.output:
-        out_dir = args.output
-        os.makedirs(out_dir, exist_ok=True)
-        report = build_report(
-            target=args.target, hosts=hosts,
-            port_results={}, service_guesses={}, os_guesses={},
-            subdomains=None,
-            started_at=started, finished_at=finished,
-            scan_meta={"phase": "ping-sweep",
-                       "ping_method": args.ping_method,
-                       "rdns": bool(args.rdns)},
-        )
-        _write_outputs(report, out_dir, args.format)
-    return 0
+    return _run(args, logger, "ping")
 
 
 def cmd_port(args, logger):
-    """Scan a single host (one IP, no discovery)."""
-    started = U.utcnow_iso()
-    ports = U.parse_ports(args.ports)
-    results = port_scan(
-        args.target,
-        ports,
-        timeout=args.timeout,
-        workers=args.workers,
-        grab_banner=not args.no_banner,
-        logger=logger,
-    )
-    svcs = detect_services(results, ttl_observed=None)
-    osg = detect_os(results, ttl_observed=None)
-
-    # Synthesize a single-host hosts list so the report is uniform.
-    from modules.ping_sweep import Host
-    h = Host(ip=args.target, alive=True, method="manual")
-    finished = U.utcnow_iso()
-    if args.output:
-        os.makedirs(args.output, exist_ok=True)
-        report = build_report(
-            target=args.target, hosts=[h],
-            port_results={args.target: results},
-            service_guesses={args.target: svcs},
-            os_guesses={args.target: osg},
-            subdomains=None,
-            started_at=started, finished_at=finished,
-            scan_meta={"phase": "port-scan",
-                       "ports": args.ports,
-                       "banner": not args.no_banner,
-                       "workers": args.workers,
-                       "timeout": args.timeout},
-        )
-        _write_outputs(report, args.output, args.format)
-    return 0
+    return _run(args, logger, "port")
 
 
 def cmd_scan(args, logger):
-    """Discover + port-scan + service detect on a target range."""
-    started = U.utcnow_iso()
-
-    # 1) Discovery
-    hosts = ping_sweep(
-        args.target, timeout=args.timeout, workers=args.workers,
-        method=args.ping_method, logger=logger,
-    )
-    if args.rdns:
-        reverse_dns(hosts, timeout=1.0)
-    alive = [h for h in hosts if h.alive]
-    if not alive:
-        logger.warn("no alive hosts — nothing to scan")
-        return 1
-
-    # 2) Port scan per alive host
-    ports = U.parse_ports(args.ports)
-    port_results: Dict[str, list] = {}
-    service_guesses: Dict[str, list] = {}
-    os_guesses: Dict[str, object] = {}
-
-    for h in alive:
-        logger.info(f"--- scanning {h.ip} ({h.hostname or 'no-rdns'}) ---")
-        results = port_scan(
-            h.ip, ports, timeout=args.timeout,
-            workers=args.workers, grab_banner=not args.no_banner, logger=logger,
-        )
-        port_results[h.ip] = results
-        service_guesses[h.ip] = detect_services(results)
-        os_guesses[h.ip] = detect_os(results)
-
-    finished = U.utcnow_iso()
-    if args.output:
-        os.makedirs(args.output, exist_ok=True)
-        report = build_report(
-            target=args.target, hosts=hosts,
-            port_results=port_results,
-            service_guesses=service_guesses,
-            os_guesses=os_guesses,
-            subdomains=None,
-            started_at=started, finished_at=finished,
-            scan_meta={"phase": "scan",
-                       "ping_method": args.ping_method,
-                       "ports": args.ports,
-                       "banner": not args.no_banner,
-                       "workers": args.workers,
-                       "timeout": args.timeout,
-                       "rdns": bool(args.rdns)},
-        )
-        _write_outputs(report, args.output, args.format)
-    return 0
-
-
-def cmd_subdomains(args, logger):
-    started = U.utcnow_iso()
-    ensure_default_wordlist()
-    subs = enumerate_subdomains(
-        args.domain,
-        method=args.method,
-        wordlist=args.wordlist,
-        workers=args.workers,
-        timeout=args.timeout,
-        logger=logger,
-    )
-    finished = U.utcnow_iso()
-    if args.output:
-        os.makedirs(args.output, exist_ok=True)
-        report = build_report(
-            target=args.domain, hosts=[],
-            port_results={}, service_guesses={}, os_guesses={},
-            subdomains=subs,
-            started_at=started, finished_at=finished,
-            scan_meta={"phase": "subdomain-enum",
-                       "method": args.method,
-                       "wordlist": args.wordlist or "builtin"},
-        )
-        _write_outputs(report, args.output, args.format)
-    return 0
+    return _run(args, logger, "scan")
 
 
 def cmd_all(args, logger):
-    """Network scan + subdomain enum in one shot.  Subdomains only when
-    the target parses as a domain name (no slash, no IP-shaped)."""
-    started = U.utcnow_iso()
-    rc = cmd_scan(args, logger)
-    if rc != 0:
-        return rc
-    if _looks_like_domain(args.target):
-        logger.info("--- subdomain pass on the same target ---")
-        subs = enumerate_subdomains(
-            args.target, method="both", wordlist=args.wordlist,
-            workers=args.workers, timeout=args.timeout, logger=logger,
-        )
-        # Append to whatever scan wrote
-        if args.output:
-            json_path = os.path.join(args.output, "report.json")
-            if os.path.exists(json_path):
-                import json as _json
-                with open(json_path, "r", encoding="utf-8") as f:
-                    report = _json.load(f)
-                report["subdomains"] = [s.to_dict() for s in subs]
-                report["meta"]["scan"]["subdomain_method"] = "both"
-                finished = U.utcnow_iso()
-                report["meta"]["finished_at"] = finished
-                report["meta"]["duration_s"] = U._duration_seconds(
-                    report["meta"]["started_at"], finished,
-                )
-                write_json(report, json_path)
-                write_text(report, os.path.join(args.output, "report.txt"))
-                logger.ok(f"updated: {json_path}")
-    return 0
+    return _run(args, logger, "all")
 
 
-def _looks_like_domain(target: str) -> bool:
-    import re
-    t = target.strip().lower()
-    if "/" in t or "," in t or "-" in t and t.count(".") == 1:
-        # CIDR / range / list — skip
-        return False
-    # crude: has letters and at least one dot, no digits-only octets
-    return bool(re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", t)) and not t.replace(".", "").isdigit()
+def cmd_subdomains(args, logger):
+    return _run(args, logger, "subdomains")
 
 
-# --- Shared arg parser & helpers ------------------------------------------
-
-def _write_outputs(report, out_dir: str, fmt: str) -> None:
-    """Write the report in the requested format(s).  Always writes JSON
-    (so downstream tools can consume it) plus the formats the user asked
-    for."""
-    json_path = os.path.join(out_dir, "report.json")
-    write_json(report, json_path)
-    logger = _global_logger  # set in main()
-    logger.ok(f"wrote {json_path}")
-    if fmt in ("text", "both"):
-        txt_path = os.path.join(out_dir, "report.txt")
-        write_text(report, txt_path)
-        logger.ok(f"wrote {txt_path}")
+def cmd_ui(args, logger):
+    try:
+        from ui import main as ui_main
+    except ImportError as exc:
+        logger.err(f"NiceGUI is not installed; install requirements.txt first ({exc})")
+        return 1
+    return ui_main(host=args.host, port=args.port)
 
 
-# Module-level so _write_outputs can find it without threading args.
-_global_logger = None  # type: ignore[var-annotated]
+def _request_from_args(args, operation: str) -> ScanRequest:
+    profile = getattr(args, "profile", "standard")
+    ports = getattr(args, "ports", "top1000")
+    if profile == "custom":
+        ports = parse_ports(ports)
+    target = getattr(args, "domain", "") if operation == "subdomains" else getattr(args, "target", "")
+    return ScanRequest(
+        target=target, profile=profile,
+        discovery_method=getattr(args, "ping_method", "auto"), ports=ports,
+        timeout=args.timeout, workers=args.workers,
+        reverse_dns=args.rdns, banner_inspection=not getattr(args, "no_banner", False),
+        subdomain_enumeration=False, output_formats=args.format,
+        output_directory=args.output, rate_limit=args.rate_limit,
+        wordlist=getattr(args, "wordlist", None), operation=operation,
+        subdomain_method=getattr(args, "method", "both") if operation == "subdomains" else "both",
+    )
+
+
+def _bounded_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not (value >= 0.01 and value <= 120):
+        raise argparse.ArgumentTypeError("must be between 0.01 and 120")
+    return value
+
+
+def _bounded_workers(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 1 <= value <= 1024:
+        raise argparse.ArgumentTypeError("must be between 1 and 1024")
+    return value
+
+
+def _rate_limit(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not (value > 0 and value <= 100000):
+        raise argparse.ArgumentTypeError("must be between 0 and 100000")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="netscope",
-        description="NetScope - Network Scanner & Reconnaissance Toolkit "
-                    "(authorized testing only).",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument("-q", "--quiet", action="store_true",
-                   help="suppress info-level stderr messages")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="enable debug-level messages")
-    p.add_argument("--no-color", action="store_true",
-                   help="disable ANSI color output")
+    parser = argparse.ArgumentParser(prog="netscope", description="NetScope — authorized IPv4 reconnaissance only.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("-q", "--quiet", action="store_true", help="suppress info-level stderr messages")
+    parser.add_argument("-v", "--verbose", action="store_true", help="enable debug-level messages")
+    parser.add_argument("--no-color", action="store_true", help="disable ANSI color output")
+    parser.add_argument("--yes", action="store_true", help="skip the authorization prompt (use only in controlled automation)")
+    sub = parser.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
-
-    # common knobs (added to every subcommand)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("-t", "--timeout", type=float, default=1.5,
-                        help="per-probe timeout in seconds")
-    common.add_argument("-w", "--workers", type=int, default=200,
-                        help="max concurrent workers")
-    common.add_argument("-o", "--output", metavar="DIR",
-                        help="write JSON+text reports into DIR")
-    common.add_argument("-f", "--format", choices=("json", "text", "both"),
-                        default="both",
-                        help="output format(s) to write when -o is set")
+    common.add_argument("-t", "--timeout", type=_bounded_float, default=1.5, help="per-probe timeout in seconds")
+    common.add_argument("-w", "--workers", type=_bounded_workers, default=200, help="maximum concurrent workers")
+    common.add_argument("-o", "--output", metavar="DIR", help="directory for the requested report format(s)")
+    common.add_argument("-f", "--format", choices=("json", "text", "both", "html", "all"), default="both", help="report format(s); json/text/both are exact")
+    common.add_argument("--rate-limit", type=_rate_limit, help="maximum probes per second (unset means unlimited)")
 
-    # ping
-    pp = sub.add_parser("ping", parents=[common],
-                        help="discover live hosts (ICMP or ARP)",
-                        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    pp.add_argument("target", help="IP, CIDR (e.g. 192.168.1.0/24) or range")
-    pp.add_argument("--method", dest="ping_method",
-                    choices=("auto", "arp", "icmp"), default="auto",
-                    help="ping method (arp needs scapy + root)")
-    pp.add_argument("--no-rdns", dest="rdns", action="store_false",
-                    help="skip reverse-DNS lookups on alive hosts")
-    pp.set_defaults(func=cmd_ping)
+    def add_rdns(command):
+        group = command.add_mutually_exclusive_group()
+        group.add_argument("--rdns", dest="rdns", action="store_true", help="perform reverse-DNS lookups")
+        group.add_argument("--no-rdns", dest="rdns", action="store_false", help="skip reverse-DNS lookups")
+        command.set_defaults(rdns=True)
 
-    # port (single host)
-    pt = sub.add_parser("port", parents=[common],
-                        help="TCP port-scan a single host",
-                        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    pt.add_argument("target", help="single IP to scan")
-    pt.add_argument("-p", "--ports", default="top1000",
-                    help="port spec: top100, top1000, all, 1-1024, 22,80,443")
-    pt.add_argument("--no-banner", action="store_true",
-                    help="skip banner grabbing (faster)")
-    pt.set_defaults(func=cmd_port)
+    ping = sub.add_parser("ping", parents=[common], help="discover live IPv4 hosts")
+    ping.add_argument("target", help="IPv4, CIDR, range, or comma-separated IPv4 list")
+    ping.add_argument("--method", dest="ping_method", choices=("auto", "arp", "icmp"), default="auto", help="auto uses ARP only on a directly connected IPv4 link")
+    add_rdns(ping)
+    ping.set_defaults(func=cmd_ping)
 
-    # scan (discover + port)
-    ps = sub.add_parser("scan", parents=[common],
-                        help="discover + TCP port-scan + service detection",
-                        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ps.add_argument("target", help="IP, CIDR or range")
-    ps.add_argument("-p", "--ports", default="top1000",
-                    help="port spec: top100, top1000, all, 1-1024, 22,80,443")
-    ps.add_argument("--method", dest="ping_method",
-                    choices=("auto", "arp", "icmp"), default="auto")
-    ps.add_argument("--no-rdns", dest="rdns", action="store_false")
-    ps.add_argument("--no-banner", action="store_true",
-                    help="skip banner grabbing (faster)")
-    ps.set_defaults(func=cmd_scan)
+    port = sub.add_parser("port", parents=[common], help="scan one IPv4 host")
+    port.add_argument("target", help="one IPv4 address or resolvable domain")
+    port.add_argument("-p", "--ports", default="top1000", help="top100, top1000 (ports 1-1000), all, range, or list")
+    port.add_argument("--profile", choices=("quick", "standard", "full", "custom"), default="custom")
+    port.add_argument("--no-banner", action="store_true", help="skip banner grabbing")
+    port.set_defaults(rdns=False, func=cmd_port)
 
-    # subdomains
-    psub = sub.add_parser("subdomains", parents=[common],
-                          help="enumerate subdomains for a domain",
-                          formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    psub.add_argument("domain", help="e.g. example.com")
-    psub.add_argument("--method", choices=("passive", "active", "both"),
-                      default="both",
-                      help="passive=crt.sh only, active=wordlist only, both=combined")
-    psub.add_argument("--wordlist", metavar="PATH",
-                      help="path to subdomain wordlist (default: bundled)")
-    psub.set_defaults(func=cmd_subdomains)
+    scan = sub.add_parser("scan", parents=[common], help="discover and TCP-scan IPv4 targets")
+    scan.add_argument("target", help="IPv4, CIDR, range, or resolvable domain")
+    scan.add_argument("-p", "--ports", default="top1000", help="top100, top1000 (ports 1-1000), all, range, or list")
+    # ``custom`` keeps an explicitly supplied ``--ports`` value authoritative;
+    # named profiles still work when the operator selects one explicitly.
+    scan.add_argument("--profile", choices=("quick", "standard", "full", "custom"), default="custom")
+    scan.add_argument("--method", dest="ping_method", choices=("auto", "arp", "icmp"), default="auto")
+    add_rdns(scan)
+    scan.add_argument("--no-banner", action="store_true", help="skip banner grabbing")
+    scan.set_defaults(func=cmd_scan)
 
-    # all
-    pa = sub.add_parser("all", parents=[common],
-                        help="scan + (if target is a domain) subdomains",
-                        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    pa.add_argument("target", help="IP/CIDR/range, OR a domain like example.com")
-    pa.add_argument("-p", "--ports", default="top1000",
-                    help="port spec: top100, top1000, all, 1-1024, 22,80,443")
-    pa.add_argument("--method", dest="ping_method",
-                    choices=("auto", "arp", "icmp"), default="auto")
-    pa.add_argument("--no-rdns", dest="rdns", action="store_false")
-    pa.add_argument("--no-banner", action="store_true",
-                    help="skip banner grabbing (faster)")
-    pa.add_argument("--wordlist", metavar="PATH",
-                    help="path to subdomain wordlist (default: bundled)")
-    pa.set_defaults(func=cmd_all)
+    domains = sub.add_parser("subdomains", parents=[common], help="enumerate subdomains for a domain")
+    domains.add_argument("domain", help="hostname such as example.com")
+    domains.add_argument("--method", choices=("passive", "active", "both"), default="both")
+    domains.add_argument("--wordlist", metavar="PATH", help="readable subdomain wordlist")
+    domains.set_defaults(target=None, rdns=False, func=cmd_subdomains)
 
-    return p
+    all_command = sub.add_parser("all", parents=[common], help="scan a target and enumerate subdomains when it is a domain")
+    all_command.add_argument("target", help="IPv4/CIDR/range, or domain such as example.com")
+    all_command.add_argument("-p", "--ports", default="top1000", help="top100, top1000 (ports 1-1000), all, range, or list")
+    # Keep the command-line port expression authoritative unless a profile is
+    # explicitly selected (quick/standard/full).
+    all_command.add_argument("--profile", choices=("quick", "standard", "full", "custom"), default="custom")
+    all_command.add_argument("--method", dest="ping_method", choices=("auto", "arp", "icmp"), default="auto")
+    add_rdns(all_command)
+    all_command.add_argument("--no-banner", action="store_true", help="skip banner grabbing")
+    all_command.add_argument("--wordlist", metavar="PATH", help="readable subdomain wordlist")
+    all_command.set_defaults(func=cmd_all)
+
+    ui_command = sub.add_parser("ui", help="start the local NiceGUI browser interface")
+    ui_command.add_argument("--host", default="127.0.0.1", choices=("127.0.0.1", "localhost"), help="bind address (loopback only)")
+    ui_command.add_argument("--port", type=int, default=8080, help="HTTP port")
+    ui_command.set_defaults(func=cmd_ui, rdns=False)
+    return parser
 
 
-def install_signal_handlers(logger) -> None:
-    """Make Ctrl+C a clean exit instead of a stack trace."""
-    def _sigint(_signum, _frame):
-        logger.warn("interrupted — exiting cleanly")
-        sys.exit(130)
-    signal.signal(signal.SIGINT, _sigint)
+def install_signal_handlers(logger, token: CancellationToken) -> None:
+    def interrupt(_signum, _frame):
+        logger.warn("interrupt received — cancelling; partial results will be preserved")
+        token.cancel()
+    signal.signal(signal.SIGINT, interrupt)
+
+
+def _safety_ack(args, logger) -> bool:
+    if args.cmd == "ui" or args.yes or os.environ.get("NETSCOPE_I_KNOW_WHAT_IM_DOING") == "1":
+        return True
+    target = getattr(args, "target", None) or getattr(args, "domain", "") or ""
+    logger.warn("NetScope is for systems you own or have written permission to test.")
+    logger.info(f"Target: {target}")
+    if not sys.stdin.isatty():
+        logger.err("non-interactive run — use --yes or NETSCOPE_I_KNOW_WHAT_IM_DOING=1")
+        return False
+    try:
+        accepted = input("Type 'yes' to continue: ").strip().lower() == "yes"
+    except EOFError:
+        accepted = False
+    if not accepted:
+        logger.err("aborted by user")
+    return accepted
 
 
 def main(argv: List[str] | None = None) -> int:
-    global _global_logger
     parser = build_parser()
     args = parser.parse_args(argv)
-
     if args.no_color:
         os.environ["NO_COLOR"] = "1"
-        U._USE_COLOR = False  # type: ignore[attr-defined]
-
+        U._USE_COLOR = False
     logger = U.StderrLogger(quiet=args.quiet, verbose=args.verbose)
-    _global_logger = logger
-
-    U.print_banner()
-    install_signal_handlers(logger)
-
-    if U.is_root():
-        logger.info(U.dim("running as root — ARP sweep and raw sockets enabled"))
-    else:
-        logger.info(U.dim("not running as root — using ICMP sweep and TCP connect"))
-
     if not _safety_ack(args, logger):
         return 2
-
-    try:
+    if args.cmd == "ui":
         return args.func(args, logger)
+    try:
+        # Validate all fields before the engine is allowed to perform I/O.
+        operation = args.cmd
+        request = _request_from_args(args, operation)
+        ScanEngine(logger=logger).validate_request(request)
+        return args.func(args, logger)
+    except (ValidationError, ValueError) as exc:
+        parser.error(str(exc))
     except KeyboardInterrupt:
-        logger.warn("interrupted — exiting cleanly")
         return 130
-    except Exception as exc:  # last-resort: never crash silently
+    except Exception as exc:
         logger.err(f"fatal: {exc}")
         if args.verbose:
             traceback.print_exc()
         return 1
-
-
-# --- Safety prompt ----------------------------------------------------------
-
-# Many recon tools blow up the moment you run them because users fire at
-# arbitrary internet hosts.  A single one-time prompt is the lightest
-# friction that still makes the user think.  Disable with --yes.
-
-def _safety_ack(args, logger) -> bool:
-    if os.environ.get("NETSCOPE_I_KNOW_WHAT_IM_DOING") == "1":
-        return True
-    # Skip the prompt for obviously harmless operations (no target = no scan)
-    if getattr(args, "cmd", None) in (None,):
-        return True
-
-    target = getattr(args, "target", None) or getattr(args, "domain", "") or ""
-    logger.warn(
-        "NetScope is a reconnaissance tool. Only run it against systems "
-        "you own or have written permission to test."
-    )
-    logger.info(f"Target: {target}")
-    if not sys.stdin.isatty():
-        # Non-interactive: require the env opt-in
-        logger.err("non-interactive run — set NETSCOPE_I_KNOW_WHAT_IM_DOING=1 to proceed")
-        return False
-    try:
-        ans = input("Type 'yes' to continue, anything else to abort: ").strip().lower()
-    except EOFError:
-        return False
-    if ans == "yes":
-        return True
-    logger.err("aborted by user")
-    return False
+    return 1
 
 
 if __name__ == "__main__":

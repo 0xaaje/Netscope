@@ -1,6 +1,6 @@
-# NetScope - Network Scanner & Reconnaissance Tool
-# Optional dependencies. The tool runs with stdlib only if these are missing
-# (scapy is used for ARP ping sweep; requests is used for crt.sh subdomain enum).
-
-scapy>=2.5.0     # Optional: enables ARP ping sweep (requires root)
-requests>=2.31.0 # Optional: enables crt.sh passive subdomain enumeration
+# NetScope runtime dependencies (Python 3.10+)
+# NiceGUI runs in browser mode and does not require Node.js.
+nicegui>=3.16,<4
+scapy>=2.5.0
+requests>=2.31.0
+cryptography>=43.0

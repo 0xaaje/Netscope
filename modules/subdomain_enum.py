@@ -18,10 +18,9 @@ import os
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from typing import Iterable, List, Optional, Set
-from urllib.parse import urlparse
+from typing import Callable, List, Optional, Set
 
-from .utils import cyan, dim, green, red, yellow
+from .utils import ValidationError, cyan, dim, green, normalize_domain, validate_timeout, validate_workers
 
 
 # --- Result type ------------------------------------------------------------
@@ -101,11 +100,14 @@ def ensure_default_wordlist() -> str:
 
 
 def load_wordlist(path: Optional[str]) -> List[str]:
-    """Load a wordlist from disk, or fall back to the bundled default."""
-    if path and os.path.exists(path):
+    """Load a wordlist from disk, or fall back to the in-memory default."""
+    if path:
+        if not os.path.isfile(path) or not os.access(path, os.R_OK):
+            raise ValidationError(f"wordlist does not exist or is not readable: {path}")
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             return [w.strip() for w in f if w.strip() and not w.startswith("#")]
-    ensure_default_wordlist()
+    # Keep the built-in list in memory so a scan never creates an unexpected
+    # repository file.  A custom path is available for operators who need one.
     return list(_BUILTIN_SUBDOMAINS)
 
 
@@ -119,53 +121,57 @@ def enumerate_subdomains(
     workers: int = 32,
     timeout: float = 2.0,
     logger=None,
+    on_result: Optional[Callable[[SubdomainHit], None]] = None,
+    cancellation=None,
 ) -> List[SubdomainHit]:
     """Enumerate subdomains for `domain`.  Returns deduped hits."""
     if logger is None:
         from .utils import StderrLogger
         logger = StderrLogger()
 
-    domain = (domain or "").strip().lower()
-    domain = domain.replace("http://", "").replace("https://", "").split("/", 1)[0]
-    if not domain or "." not in domain:
-        logger.err(f"invalid domain: {domain!r}")
-        return []
+    domain = normalize_domain(domain)
+    timeout = validate_timeout(timeout)
+    workers = validate_workers(workers)
+    if method not in {"passive", "active", "both"}:
+        raise ValidationError("subdomain method must be passive, active, or both")
 
     logger.info(f"subdomain enum for {domain} — method={method}")
 
     found: dict = {}  # subdomain -> SubdomainHit (later sources overwrite)
 
     if method in ("passive", "both"):
-        for hit in _crtsh_enum(domain, logger=logger):
+        for hit in _crtsh_enum(domain, logger=logger, timeout=timeout, cancellation=cancellation):
             found[hit.subdomain] = hit
 
     if method in ("active", "both"):
         words = load_wordlist(wordlist)
         logger.info(f"active brute force — {len(words)} candidates")
-        socket.setdefaulttimeout(timeout)
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures = {executor.submit(_resolve, f"{w}.{domain}"): f"{w}.{domain}" for w in words}
         try:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futures = {
-                    ex.submit(_resolve, f"{w}.{domain}"): f"{w}.{domain}"
-                    for w in words
-                }
-                for fut in as_completed(futures):
-                    fqdn = futures[fut]
-                    try:
-                        ips = fut.result() or []
-                    except Exception:
-                        ips = []
-                    if ips:
-                        if fqdn not in found:
-                            found[fqdn] = SubdomainHit(
-                                subdomain=fqdn, source="bruteforce",
-                                ips=ips, alive=True,
-                            )
-                        else:
-                            found[fqdn].ips = list(set(found[fqdn].ips) | set(ips))
-                            found[fqdn].alive = True
+            for fut in as_completed(futures):
+                if _cancelled(cancellation):
+                    break
+                fqdn = futures[fut]
+                try:
+                    ips = fut.result() or []
+                except Exception:
+                    ips = []
+                if ips:
+                    if fqdn not in found:
+                        found[fqdn] = SubdomainHit(subdomain=fqdn, source="bruteforce", ips=ips, alive=True)
+                    else:
+                        found[fqdn].ips = sorted(set(found[fqdn].ips) | set(ips))
+                        found[fqdn].alive = True
+                    if on_result:
+                        on_result(found[fqdn])
         finally:
-            socket.setdefaulttimeout(None)
+            if _cancelled(cancellation):
+                for fut in futures:
+                    fut.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
 
     hits = sorted(found.values(), key=lambda h: h.subdomain)
     logger.ok(f"{len(hits)} subdomain(s) found for {domain}")
@@ -180,8 +186,10 @@ def enumerate_subdomains(
 
 # --- Passive: crt.sh --------------------------------------------------------
 
-def _crtsh_enum(domain: str, *, logger, timeout: float = 15.0) -> List[SubdomainHit]:
+def _crtsh_enum(domain: str, *, logger, timeout: float = 15.0, cancellation=None) -> List[SubdomainHit]:
     """Query crt.sh for CT logs mentioning `domain`."""
+    if _cancelled(cancellation):
+        return []
     try:
         import requests
     except ImportError:
@@ -198,6 +206,8 @@ def _crtsh_enum(domain: str, *, logger, timeout: float = 15.0) -> List[Subdomain
 
     if r.status_code != 200:
         logger.warn(f"crt.sh returned HTTP {r.status_code}")
+        return []
+    if _cancelled(cancellation):
         return []
 
     try:
@@ -220,6 +230,8 @@ def _crtsh_enum(domain: str, *, logger, timeout: float = 15.0) -> List[Subdomain
     logger.info(f"crt.sh: {len(found)} unique name(s)")
     hits: List[SubdomainHit] = []
     for sub in sorted(found):
+        if _cancelled(cancellation):
+            break
         ips = _resolve(sub) or []
         hits.append(SubdomainHit(
             subdomain=sub, source="crt.sh", ips=ips, alive=bool(ips),
@@ -240,3 +252,10 @@ def _resolve(fqdn: str) -> List[str]:
         if sockaddr and sockaddr[0]:
             out.append(sockaddr[0])
     return sorted(set(out))
+
+
+def _cancelled(token) -> bool:
+    if token is None:
+        return False
+    method = getattr(token, "is_cancelled", None)
+    return bool(method()) if callable(method) else bool(getattr(token, "cancelled", False))

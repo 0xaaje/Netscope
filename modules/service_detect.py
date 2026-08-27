@@ -13,7 +13,6 @@ from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Sequence
 
 from .port_scanner import PortResult
-from .utils import dim, yellow
 
 
 # --- Data types -------------------------------------------------------------
@@ -50,8 +49,8 @@ class OSGuess:
 _SERVICE_RULES: list = [
     # SSH
     (22, r"OpenSSH[_\- ]([0-9][0-9p.\-]+)",                 "OpenSSH",     1, None, "high"),
-    (22, r"SSH-2\.0-(?:OpenSSH_[0-9p.\-]+|libssh[_-]([0-9.\-]+)|dropbear[_\- ]?([0-9.\-]+))",
-                                                              "SSH",         0, None, "high"),
+    (22, r"SSH-2\.0-libssh[_-]([0-9.\-]+)",                 "libssh",       1, None, "high"),
+    (22, r"SSH-2\.0-dropbear[_\- ]?([0-9.\-]+)",          "Dropbear SSH", 1, None, "high"),
     (22, r"dropbear[_\- ]?([0-9.\-]+)",                     "Dropbear SSH", 1, None, "high"),
 
     # HTTP servers
@@ -63,7 +62,7 @@ _SERVICE_RULES: list = [
     (80, r"Server:\s*gunicorn/([0-9.]+)",                   "gunicorn",     1, None, "medium"),
     (80, r"Server:\s*uvicorn",                             "uvicorn",      None, None, "low"),
     (80, r"Server:\s*werkzeug/([0-9.]+)",                   "Werkzeug",     1, None, "medium"),
-    (None, r"Server:\s*([A-Za-z][A-Za-z0-9.\-]+)/([0-9.]+)", "HTTP Server",  1, 2, "medium"),
+    (None, r"Server:\s*([A-Za-z][A-Za-z0-9.\-]+)/([0-9.]+)", "HTTP Server",  2, None, "medium"),
 
     # FTP
     (21, r"vsftpd ([0-9.]+)",                               "vsftpd",       1, None, "high"),
@@ -162,11 +161,11 @@ def detect_services(
             if not m:
                 continue
             version = None
-            if vgrp is not None and vgrp < len(m.groups()) and m.group(vgrp):
-                version = m.group(vgrp)
+            if vgrp is not None and _capture_group(m, vgrp):
+                version = _capture_group(m, vgrp)
             extra = None
-            if xgrp is not None and xgrp < len(m.groups()) and m.group(xgrp):
-                extra = m.group(xgrp)
+            if xgrp is not None and _capture_group(m, xgrp):
+                extra = _capture_group(m, xgrp)
             out.append(ServiceGuess(
                 port=pr.port,
                 product=product,
@@ -207,7 +206,7 @@ def detect_os(
             best = guess_from_ttl
         else:
             # Note agreement / disagreement
-            if best.family != guess_from_ttl.family:
+            if best.family != guess_from_ttl.family and _rank_conf(best.confidence) <= _rank_conf("low"):
                 best.confidence = "low"
                 best.reason += f"; TTL {ttl_observed} suggests {guess_from_ttl.family}"
 
@@ -219,6 +218,13 @@ def detect_os(
 # --- helpers ---------------------------------------------------------------
 
 _CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def _capture_group(match: re.Match, index: Optional[int]) -> Optional[str]:
+    """Read a numbered capture safely (groups are 1..N, not 0..N-1)."""
+    if index is None or index < 1 or index > len(match.groups()):
+        return None
+    return match.group(index)
 
 
 def _rank_conf(c: str) -> int:

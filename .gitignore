@@ -1,4 +1,13 @@
-﻿venv/
-output/
+.venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+output/
+reports/
+wordlists/
+*.log
+*.tmp
+*.swp

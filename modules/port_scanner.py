@@ -10,11 +10,18 @@
 """
 from __future__ import annotations
 
+import hashlib
+import ipaddress
+import re
 import socket
+import ssl
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
-from typing import Iterable, List, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass
+from typing import Callable, List, Optional, Sequence, Tuple
 
+from . import __version__
 from .utils import cyan, dim, green, red, yellow
 
 
@@ -30,6 +37,8 @@ class PortResult:
     service_hint: Optional[str] = None
     rtt_ms: Optional[float] = None
     reason: str = ""
+    http_info: Optional[dict] = None
+    tls_info: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -45,6 +54,9 @@ def port_scan(
     workers: int = 200,
     grab_banner: bool = True,
     logger=None,
+    on_result: Optional[Callable[[PortResult], None]] = None,
+    cancellation=None,
+    rate_limit: Optional[float] = None,
 ) -> List[PortResult]:
     """Scan `host` over `ports` (an iterable of ints).
 
@@ -56,7 +68,12 @@ def port_scan(
         from .utils import StderrLogger
         logger = StderrLogger()
 
-    ports = sorted(set(int(p) for p in ports))
+    from .utils import parse_ports, parse_single_ipv4, validate_rate_limit, validate_timeout, validate_workers
+    host = parse_single_ipv4(host)
+    timeout = validate_timeout(timeout)
+    workers = validate_workers(workers)
+    ports = parse_ports(ports)
+    rate_limit = validate_rate_limit(rate_limit)
     if not ports:
         logger.warn("empty port list — nothing to scan")
         return []
@@ -66,36 +83,40 @@ def port_scan(
         f"timeout={timeout}s, banner={grab_banner}"
     )
 
-    socket.setdefaulttimeout(timeout)
     results: List[PortResult] = []
+    limiter = _RateLimiter(rate_limit) if rate_limit else None
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures = {
+        executor.submit(_probe, host, p, timeout, grab_banner, limiter, cancellation): p
+        for p in ports
+    }
     try:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {
-                ex.submit(_probe, host, p, timeout, grab_banner): p
-                for p in ports
-            }
-            for fut in as_completed(futures):
-                p = futures[fut]
-                try:
-                    res = fut.result()
-                except Exception as exc:
-                    res = PortResult(host=host, port=p, reason=f"exception: {exc}")
-                results.append(res)
-                if res.open:
-                    tag = green("open")
-                    extra = []
-                    if res.service_hint:
-                        extra.append(yellow(res.service_hint))
-                    if res.banner:
-                        bn = res.banner.replace("\r", " ").replace("\n", " ")
-                        if len(bn) > 80:
-                            bn = bn[:77] + "..."
-                        extra.append(dim(f'"{bn}"'))
-                    logger.ok(f"  {host}:{p:<5d}  {tag}  " + "  ".join(extra))
-                else:
-                    logger.debug(f"  {host}:{p}  {res.state} ({res.reason})")
+        for fut in as_completed(futures):
+            if _cancelled(cancellation):
+                break
+            p = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as exc:
+                res = PortResult(host=host, port=p, reason=f"exception: {exc}")
+            results.append(res)
+            if on_result:
+                on_result(res)
+            if res.open:
+                extra = [yellow(res.service_hint)] if res.service_hint else []
+                if res.banner:
+                    bn = res.banner.replace("\r", " ").replace("\n", " ")
+                    extra.append(dim(f'"{bn[:77] + "..." if len(bn) > 80 else bn}"'))
+                logger.ok(f"  {host}:{p:<5d}  {green('open')}  " + "  ".join(extra))
+            else:
+                logger.debug(f"  {host}:{p}  {res.state} ({res.reason})")
     finally:
-        socket.setdefaulttimeout(None)
+        if _cancelled(cancellation):
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
 
     results.sort(key=lambda r: r.port)
     n_open = sum(1 for r in results if r.open)
@@ -105,10 +126,15 @@ def port_scan(
 
 # --- Single-port probe -----------------------------------------------------
 
-def _probe(host: str, port: int, timeout: float, grab: bool) -> PortResult:
-    import time
+def _probe(host: str, port: int, timeout: float, grab: bool, rate_limiter=None, cancellation=None) -> PortResult:
     t0 = time.perf_counter()
     res = PortResult(host=host, port=port)
+
+    if _cancelled(cancellation):
+        res.reason = "cancelled"
+        return res
+    if rate_limiter:
+        rate_limiter.wait(cancellation)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -132,8 +158,19 @@ def _probe(host: str, port: int, timeout: float, grab: bool) -> PortResult:
         res.state = "open"
         res.rtt_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         res.service_hint = _service_hint(port)
+        if _is_tls_port(port):
+            try:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                s = context.wrap_socket(s, server_hostname=None if _is_ip(host) else host)
+                res.tls_info = _tls_observation(s, host, port)
+            except Exception as exc:
+                res.tls_info = {"error": str(exc)}
         if grab:
             res.banner = _grab_banner(s, port, timeout)
+            if _is_http_port(port):
+                res.http_info = _http_observation(res.banner, "https" if _is_tls_port(port) else "http")
         return res
     finally:
         try:
@@ -150,23 +187,30 @@ BANNER_READ_TIMEOUT = 1.5
 
 # Probes we send BEFORE reading — services that need a kick to talk.
 # Order: service-guess, bytes.
+_HTTP_PROBE = f"HEAD / HTTP/1.0\r\nUser-Agent: NetScope/{__version__}\r\n\r\n".encode("ascii")
+
 _PROBES = [
-    (b"http",    b"HEAD / HTTP/1.0\r\nUser-Agent: NetScope/1.0\r\n\r\n"),
-    (b"smtp",    b"EHLO netscope.local\r\n"),
-    (b"ftp",     b"USER anonymous\r\n"),
-    (b"pop3",    b"QUIT\r\n"),
-    (b"imap",    b"A1 LOGOUT\r\n"),
-    (b"redis",   b"PING\r\n"),
-    (b"mysql",   b""),  # server greets first
-    (b"ssh",     b""),  # server greets first
-    (b"default", b""),
+    ("http",    _HTTP_PROBE),
+    ("smtp",    b"EHLO netscope.local\r\n"),
+    ("ftp",     b"USER anonymous\r\n"),
+    ("pop3",    b"QUIT\r\n"),
+    ("imap",    b"A1 LOGOUT\r\n"),
+    ("redis",   b"PING\r\n"),
+    ("mysql",   b""),
+    ("ssh",     b""),
+    ("default", b""),
 ]
 
 
 def _probe_for(port: int) -> Tuple[str, bytes]:
     """Pick a probe based on the port's likely service."""
+    hint = _service_hint(port)
+    if hint in {"http", "http-alt"}:
+        hint = "http"
+    if hint in {"https", "https-alt"}:
+        hint = "http"
     for name, _ in _PROBES:
-        if name == _service_hint(port):
+        if name == hint:
             return name, dict(_PROBES)[name]
     return "default", b""
 
@@ -197,6 +241,87 @@ def _grab_banner(sock: socket.socket, port: int, timeout: float) -> Optional[str
         return text
     except Exception:
         return None
+
+
+def _cancelled(token) -> bool:
+    if token is None:
+        return False
+    method = getattr(token, "is_cancelled", None)
+    return bool(method()) if callable(method) else bool(getattr(token, "cancelled", False))
+
+
+class _RateLimiter:
+    def __init__(self, rate: float) -> None:
+        self.interval = 1.0 / rate
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self, cancellation=None) -> None:
+        with self._lock:
+            now = time.monotonic()
+            due = max(now, self._next)
+            self._next = due + self.interval
+        while due > time.monotonic():
+            if _cancelled(cancellation):
+                return
+            time.sleep(min(0.02, due - time.monotonic()))
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _is_tls_port(port: int) -> bool:
+    return port in {443, 465, 636, 989, 990, 993, 995, 2376, 5986, 8443}
+
+
+def _is_http_port(port: int) -> bool:
+    return port in {80, 81, 88, 89, 3000, 3001, 4000, 443, 5000, 5001, 5601, 8000, 8008, 8080, 8081, 8088, 8089, 8090, 8443, 8888, 9000, 9001, 9999, 10000}
+
+
+def _http_observation(banner: Optional[str], scheme: str) -> Optional[dict]:
+    if not banner:
+        return None
+    match = re.search(r"HTTP/\d(?:\.\d)?\s+(\d{3})", banner, re.IGNORECASE)
+    if not match:
+        return None
+    result = {"scheme": scheme, "status": int(match.group(1))}
+    for name, key in (("server", "server"), ("content-type", "content_type"), ("location", "location")):
+        header = re.search(rf"^{re.escape(name)}:\s*(.+)$", banner, re.IGNORECASE | re.MULTILINE)
+        if header:
+            result[key] = header.group(1).strip()[:512]
+    return result
+
+
+def _tls_observation(sock: ssl.SSLSocket, host: str, port: int) -> dict:
+    result: dict = {"protocol": sock.version(), "cipher": (sock.cipher() or [None])[0]}
+    raw = sock.getpeercert(binary_form=True)
+    if not raw:
+        return result
+    result["sha256_fingerprint"] = hashlib.sha256(raw).hexdigest().upper()
+    try:
+        from cryptography import x509
+        cert = x509.load_der_x509_certificate(raw)
+        try:
+            san_extension = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            sans = [str(name.value) for name in san_extension.value]
+        except Exception:
+            sans = []
+        result.update({
+            "subject": cert.subject.rfc4514_string(),
+            "issuer": cert.issuer.rfc4514_string(),
+            "not_before": getattr(cert, "not_valid_before_utc", cert.not_valid_before).isoformat(),
+            "not_after": getattr(cert, "not_valid_after_utc", cert.not_valid_after).isoformat(),
+            "serial_number": str(cert.serial_number),
+            "sans": sans,
+        })
+    except Exception:
+        pass
+    return result
 
 
 # --- Service hint (port -> name) -------------------------------------------
