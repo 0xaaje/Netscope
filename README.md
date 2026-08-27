@@ -74,7 +74,8 @@ are not required.
 sudo apt update
 sudo apt install python3-full python3-venv
 
-git clone https://github.com/0xaaje/Netscope.git
+# Use a lowercase local folder so the next command works on Linux/Kali.
+git clone https://github.com/0xaaje/Netscope.git netscope
 cd netscope
 
 python3 -m venv .venv
