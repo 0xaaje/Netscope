@@ -311,6 +311,9 @@ def build_app() -> None:
                 table.on("rowClick", lambda event: host_detail(next((row for row in rows if row["ip"] == event.args[1].get("ip")), None)))
                 if not rows:
                     ui.label("No alive hosts in saved reports yet.").classes("ns-muted mt-3")
+            # Render the refreshable section once so it also has content when
+            # the user opens it after the initial dashboard view.
+            assets()
 
         with ui.column() as reports_section:
             sections["reports"] = reports_section
@@ -318,6 +321,9 @@ def build_app() -> None:
             def reports():
                 ui.label("Reports").classes("text-2xl font-semibold")
                 ui.label("Open, download, or delete individual saved reports.").classes("ns-muted")
+                ui.label(f"Output directory: {output_root}").classes("ns-mono ns-muted text-xs")
+                with ui.row().classes("items-center gap-2 mt-3"):
+                    ui.button("Refresh", icon="refresh", on_click=reports.refresh).props("outline no-caps")
                 rows, errors = _report_rows(output_root)
                 if errors:
                     ui.label("Some report files could not be opened:").classes("text-[#f2b84b] mt-3")
@@ -329,6 +335,9 @@ def build_app() -> None:
                 table.on("open", lambda event: open_report(event.args))
                 if not rows:
                     ui.label("No saved reports yet.").classes("ns-muted mt-3")
+            # Seed the section before navigation.  This makes the empty state
+            # visible immediately and lets later refreshes replace its rows.
+            reports()
 
         with ui.column() as compare_section:
             sections["compare"] = compare_section
@@ -356,6 +365,7 @@ def build_app() -> None:
                         ui.label("Compatible" if result.get("compatible") else "Indeterminate").classes("text-[#42d392]" if result.get("compatible") else "text-[#f2b84b]")
                         ui.code(json.dumps(result, indent=2), language="json").classes("w-full")
                 ui.button("Compare reports", icon="compare_arrows", on_click=do_compare).props("unelevated color=primary no-caps")
+            compare()
 
         with ui.column() as settings_section:
             sections["settings"] = settings_section
